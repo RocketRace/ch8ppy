@@ -1,7 +1,14 @@
-use std::{fmt::Debug, ops::{Index, IndexMut}, sync::{Arc, atomic::{AtomicU8, Ordering}, mpsc::{self, TryRecvError}}, thread, time::Duration};
+use std::{fmt::Debug, ops::{Index, IndexMut}, sync::{
+        atomic::{AtomicU16, AtomicU8, Ordering},
+        mpsc::{self, TryRecvError},
+        Arc,
+    }, thread, time::Duration};
 
-use crossterm;
-use rand::{self, Rng, rngs::ThreadRng, thread_rng};
+use crossterm::{
+    event::{self, KeyCode, KeyModifiers},
+    terminal,
+};
+use rand::{rngs::ThreadRng, thread_rng, Rng};
 
 type Nibble = u8;
 type Byte = u8;
@@ -11,10 +18,24 @@ type Row = u64;
 const MEMORY_SIZE: usize = 0x1000;
 const FONT_START: usize = 0x000;
 const FONT_SIZE: usize = 5;
-const FONT_END: usize = FONT_START + FONT_SIZE * 16;
 const PROGRAM_START: usize = 0x200;
 const STACK_DEPTH: usize = 32;
 const FRAME_HEIGHT: usize = 32;
+const DISPLAY_REFRESH_HZ: f32 = 60.;
+
+// Typical hex keypad:
+// 1 2 3 C
+// 4 5 6 D
+// 7 8 9 E
+// A 0 B F
+// QWERTY mapping:
+// 1 2 3 4
+// q w e r
+// a s d f
+// z x c v
+const INPUT_MAPPING: [char; 16] = [
+    'x', '1', '2', '3', 'q', 'w', 'e', 'a', 's', 'd', 'z', 'c', '4', 'r', 'f', 'v',
+];
 
 /// The main memory of the CHIP-8 virtual machine.
 ///
@@ -41,13 +62,15 @@ impl Default for Memory {
 
 impl Memory {
     fn from_rom(rom: &[Byte]) -> Result<Self, String> {
-        if rom.len() >= MEMORY_SIZE {
-            Err(format!("Rom size {:x} is greater than the alotted memory size", rom.len()))
-        }
-        else {
+        if PROGRAM_START + rom.len() >= MEMORY_SIZE {
+            Err(format!(
+                "Rom size {:x} is greater than the alotted memory size",
+                rom.len()
+            ))
+        } else {
             let mut mem = [0; MEMORY_SIZE];
-            mem[0..rom.len()].copy_from_slice(rom);
-            Ok(Self { data: mem, ptr: PROGRAM_START as Addr })
+            mem[PROGRAM_START..PROGRAM_START + rom.len()].copy_from_slice(rom);
+            Ok(Self { data: mem, ptr: 0 })
         }
     }
     fn get<N: Into<usize>>(&self, addr: N) -> &Byte {
@@ -154,6 +177,26 @@ impl Framebuffer {
 }
 
 #[derive(Debug, Default)]
+struct Input {
+    bits: Arc<AtomicU16>,
+}
+
+impl Input {
+    fn is_pressed(&self, x: Nibble) -> bool {
+        self.bits.load(Ordering::Relaxed) & (1 << x) != 0
+    }
+    fn get_key(&self) -> Nibble {
+        // this blocks until a key is pressed
+        loop {
+            let bits = self.bits.load(Ordering::Relaxed);
+            if bits != 0 {
+                break bits.trailing_zeros() as Nibble;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct Chip8Machine {
     mem: Memory,
     reg: Registers,
@@ -162,6 +205,7 @@ struct Chip8Machine {
     buf: Framebuffer,
     timers: Timers,
     rng: ThreadRng,
+    input: Input,
 }
 
 /// Please ensure that inputs are nibbles.
@@ -263,13 +307,23 @@ impl Chip8Machine {
         let flag = self.buf.draw_sprite(x, y, self.mem.get_slice(n));
         self.reg.set_flag(flag);
     }
-    fn skp_vx(&mut self, x: Reg) { todo!() }
-    fn sknp_vx(&mut self, x: Reg) { todo!() }
-    fn ld_vx_dt(&mut self, x: Reg) { 
+    fn skp_vx(&mut self, x: Reg) {
+        if self.input.is_pressed(x) {
+            self.pc += 2;
+        }
+    }
+    fn sknp_vx(&mut self, x: Reg) {
+        if !self.input.is_pressed(x) {
+            self.pc += 2;
+        }
+    }
+    fn ld_vx_dt(&mut self, x: Reg) {
         self.reg[x] = self.timers.dt.load(Ordering::Relaxed);
     }
-    fn ld_vx_k(&mut self, x: Reg) { todo!() }
-    fn ld_dt_vx(&mut self, x: Reg) { 
+    fn ld_vx_k(&mut self, x: Reg) {
+        self.reg[x] = self.input.get_key();
+    }
+    fn ld_dt_vx(&mut self, x: Reg) {
         self.timers.dt.store(self.reg[x], Ordering::Relaxed);
     }
     fn ld_st_vx(&mut self, x: Reg) {
@@ -297,67 +351,121 @@ impl Chip8Machine {
         }
     }
 }
+const TIMER_TERM_SIGNAL: () = ();
+const DISPLAY_TERM_SIGNAL: () = ();
+const DISPLAY_REFRESH_SIGNAL: bool = false;
+const DISPLAY_EXIT_SIGNAL: bool = true;
+
+enum ExitKind {
+    Forced,
+    Natural,
+}
+
 impl Chip8Machine {
-    fn new(rom: &[Byte]) -> Result<Self, String> { 
-        Ok(Self { 
+    fn new(rom: &[Byte]) -> Result<Self, String> {
+        Ok(Self {
             mem: Memory::from_rom(rom)?,
             rng: thread_rng(),
-            ..Default::default() 
+            pc: PROGRAM_START as Addr,
+            ..Default::default()
         })
     }
-    fn run_hex(rom: &[Byte]) -> Result<(), String> {
+    fn run_hex(rom: &[Byte]) -> Result<ExitKind, String> {
         let mut bin = vec![];
-        let hex = |c: u8| {match c {
+        let hex = |c: u8| match c {
             n @ b'0'..=b'9' => Ok(n - b'0'),
             x @ b'a'..=b'f' => Ok(x - b'a' + 10),
             x @ b'A'..=b'F' => Ok(x - b'a' + 10),
-            n => Err(format!("Byte {} in input is not a hex character", n))
-        }};
+            n => Err(format!("Byte {} in input is not a hex character", n)),
+        };
         if rom.len() & 1 == 1 {
             return Err(String::from("The program has an odd number of hex digits."));
         }
         for chunk in rom.chunks(2) {
             let h = chunk[0];
             let l = chunk[1];
-            bin.push(
-                hex(h)? << 4 | hex(l)?
-            );
+            bin.push(hex(h)? << 4 | hex(l)?);
         }
         let mut machine = Self::new(rom)?;
         machine.run()
     }
-    fn run_binary(rom: &[Byte]) -> Result<(), String> {
+    fn run_binary(rom: &[Byte]) -> Result<ExitKind, String> {
         let mut machine = Self::new(rom)?;
         machine.run()
     }
-
-    fn run(&mut self) -> Result<(), String> {
+    fn run(&mut self) -> Result<ExitKind, String> {
+        terminal::enable_raw_mode()
+            .map_err(|e| format!("Could not enable terminal raw mode: {:?}", e))?;
         let dt = Arc::clone(&self.timers.dt);
         let st = Arc::clone(&self.timers.st);
-        let (tx, rx) = mpsc::channel();
+        let (timer_tx, timer_rx) = mpsc::channel();
         thread::spawn(move || loop {
-            match rx.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => break,
+            match timer_rx.try_recv() {
+                Ok(TIMER_TERM_SIGNAL) | Err(TryRecvError::Disconnected) => break,
                 Err(TryRecvError::Empty) => (),
             }
             // Result is ignored, since we don't care about the
             // registers when they're zero
-            let _ = dt.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |n| if n != 0 { Some(n - 1) } else { None }
-            );
-            let _ = st.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |n| if n != 0 { Some(n - 1) } else { None }
-            );
-            thread::sleep(Duration::from_secs_f32(1./60.));
+            let _ = dt.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n != 0 {
+                    Some(n - 1)
+                } else {
+                    None
+                }
+            });
+            let _ = st.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n != 0 {
+                    Some(n - 1)
+                } else {
+                    None
+                }
+            });
+            thread::sleep(Duration::from_secs_f32(1. / 60.));
+        });
+        let input = Arc::clone(&self.input.bits);
+        let (display_tx, display_rx) = mpsc::channel();
+        let (input_tx, input_rx) = mpsc::channel();
+        thread::spawn(move || loop {
+            match input_rx.try_recv() {
+                Ok(DISPLAY_TERM_SIGNAL) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => (),
+            }
+            let mut key_state = 0u16;
+            while event::poll(Duration::from_millis(0)).unwrap() {
+                if let event::Event::Key(k) = event::read().unwrap() {
+                    match k.code {
+                        KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
+                            display_tx.send(DISPLAY_EXIT_SIGNAL).unwrap();
+                            // prevents race conditions as the thread can be killed at any point after this line
+                            thread::sleep(Duration::from_secs(300));
+                        }
+                        KeyCode::Char(c)
+                            if k.modifiers == KeyModifiers::NONE && INPUT_MAPPING.contains(&c) =>
+                        {
+                            key_state |= 1 << INPUT_MAPPING.iter().position(|&x| x == c).unwrap();
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            input.store(key_state, Ordering::Relaxed);
+            display_tx.send(DISPLAY_REFRESH_SIGNAL).unwrap();
+            thread::sleep(Duration::from_secs_f32(1. / DISPLAY_REFRESH_HZ));
         });
         loop {
             if self.pc >= MEMORY_SIZE as Addr {
-                tx.send(()).unwrap();
-                return Ok(())
+                timer_tx.send(TIMER_TERM_SIGNAL).unwrap();
+                input_tx.send(DISPLAY_TERM_SIGNAL).unwrap();
+                return Ok(ExitKind::Natural);
+            }
+            match display_rx.try_recv() {
+                Ok(DISPLAY_EXIT_SIGNAL) => {
+                    timer_tx.send(TIMER_TERM_SIGNAL).unwrap();
+                    input_tx.send(DISPLAY_TERM_SIGNAL).unwrap();
+                    return Ok(ExitKind::Forced);
+                }
+                Ok(DISPLAY_REFRESH_SIGNAL) => {}
+                _ => (),
             }
             let high = *self.mem.get(self.pc);
             let low = *self.mem.get(self.pc + 1);
@@ -413,8 +521,18 @@ impl Chip8Machine {
 }
 
 fn main() {
-    match Chip8Machine::run_binary(include_bytes!("../roms/programs/IBM Logo.ch8")) {
-        Ok(()) => println!("Program exited gracefully"),
-        Err(e) => panic!("{}", e)
+    match Chip8Machine::run_binary(b"\x12\x00") {
+        Ok(kind) => {
+            terminal::disable_raw_mode().unwrap();
+            match kind {
+                ExitKind::Natural => {
+                    println!("Program exited gracefully");
+                }
+                ExitKind::Forced => {
+                    println!("Program killed");
+                }
+            }
+        }
+        Err(e) => panic!("{}", e),
     }
 }
