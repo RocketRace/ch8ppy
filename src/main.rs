@@ -1,12 +1,23 @@
-use std::{fmt::Debug, ops::{Index, IndexMut}, sync::{
+use std::{
+    fmt::Debug,
+    fs::File,
+    io::{stdout, Read, Stdout, Write},
+    ops::{Index, IndexMut},
+    sync::{
         atomic::{AtomicU16, AtomicU8, Ordering},
-        mpsc::{self, TryRecvError},
+        mpsc::{self, Receiver, Sender, TryRecvError},
         Arc,
-    }, thread, time::Duration};
+    },
+    thread,
+    time::Duration,
+};
 
+use argh::FromArgs;
 use crossterm::{
+    cursor,
     event::{self, KeyCode, KeyModifiers},
-    terminal,
+    style::{Color, Colors, Print, SetBackgroundColor, SetColors},
+    terminal, ExecutableCommand, QueueableCommand,
 };
 use rand::{rngs::ThreadRng, thread_rng, Rng};
 
@@ -351,14 +362,33 @@ impl Chip8Machine {
         }
     }
 }
-const TIMER_TERM_SIGNAL: () = ();
-const DISPLAY_TERM_SIGNAL: () = ();
-const DISPLAY_REFRESH_SIGNAL: bool = false;
-const DISPLAY_EXIT_SIGNAL: bool = true;
 
+enum HaltSignal {
+    Halt,
+}
+enum DisplaySignal {
+    Refresh,
+    Exit,
+}
 enum ExitKind {
     Forced,
     Natural,
+}
+
+struct ChannelHandler {
+    timer_tx: Sender<HaltSignal>,
+    input_tx: Sender<HaltSignal>,
+    display_rx: Receiver<DisplaySignal>,
+}
+
+impl ChannelHandler {
+    fn halt(&self) -> Result<(), String> {
+        for tx in &[&self.input_tx, &self.timer_tx] {
+            tx.send(HaltSignal::Halt)
+                .map_err(|e| format!("Could not send message to thread: {:?}", e))?;
+        }
+        Ok(())
+    }
 }
 
 impl Chip8Machine {
@@ -369,6 +399,19 @@ impl Chip8Machine {
             pc: PROGRAM_START as Addr,
             ..Default::default()
         })
+    }
+    fn run_from_args(args: Args) -> Result<ExitKind, String> {
+        let executor = if args.hex {
+            Self::run_hex
+        } else {
+            Self::run_binary
+        };
+        let mut buf = vec![];
+        File::open(args.file)
+            .map_err(|e| format!("Error occurred trying to open the file: {:?}", e))?
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("Error occurred trying to read the file: {:?}", e))?;
+        executor(&buf)
     }
     fn run_hex(rom: &[Byte]) -> Result<ExitKind, String> {
         let mut bin = vec![];
@@ -393,15 +436,33 @@ impl Chip8Machine {
         let mut machine = Self::new(rom)?;
         machine.run()
     }
-    fn run(&mut self) -> Result<ExitKind, String> {
+    fn setup_terminal(&self) -> Result<Stdout, String> {
+        let mut stdout = stdout();
+        stdout
+            .execute(cursor::Hide)
+            .map_err(|e| format!("Could not hide cursor: {:?}", e))?;
+
         terminal::enable_raw_mode()
             .map_err(|e| format!("Could not enable terminal raw mode: {:?}", e))?;
+
+        Ok(stdout)
+    }
+    fn spawn_extra_threads(&self) -> Result<ChannelHandler, String> {
+        let timer_tx = self.spawn_timer()?;
+        let (display_rx, input_tx) = self.spawn_display()?;
+        Ok(ChannelHandler {
+            timer_tx,
+            input_tx,
+            display_rx,
+        })
+    }
+    fn spawn_timer(&self) -> Result<Sender<HaltSignal>, String> {
         let dt = Arc::clone(&self.timers.dt);
         let st = Arc::clone(&self.timers.st);
         let (timer_tx, timer_rx) = mpsc::channel();
         thread::spawn(move || loop {
             match timer_rx.try_recv() {
-                Ok(TIMER_TERM_SIGNAL) | Err(TryRecvError::Disconnected) => break,
+                Ok(HaltSignal::Halt) | Err(TryRecvError::Disconnected) => break,
                 Err(TryRecvError::Empty) => (),
             }
             // Result is ignored, since we don't care about the
@@ -422,12 +483,15 @@ impl Chip8Machine {
             });
             thread::sleep(Duration::from_secs_f32(1. / 60.));
         });
+        Ok(timer_tx)
+    }
+    fn spawn_display(&self) -> Result<(Receiver<DisplaySignal>, Sender<HaltSignal>), String> {
         let input = Arc::clone(&self.input.bits);
         let (display_tx, display_rx) = mpsc::channel();
         let (input_tx, input_rx) = mpsc::channel();
         thread::spawn(move || loop {
             match input_rx.try_recv() {
-                Ok(DISPLAY_TERM_SIGNAL) | Err(TryRecvError::Disconnected) => break,
+                Ok(HaltSignal::Halt) | Err(TryRecvError::Disconnected) => break,
                 Err(TryRecvError::Empty) => (),
             }
             let mut key_state = 0u16;
@@ -435,7 +499,7 @@ impl Chip8Machine {
                 if let event::Event::Key(k) = event::read().unwrap() {
                     match k.code {
                         KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
-                            display_tx.send(DISPLAY_EXIT_SIGNAL).unwrap();
+                            display_tx.send(DisplaySignal::Exit).unwrap();
                             // prevents race conditions as the thread can be killed at any point after this line
                             thread::sleep(Duration::from_secs(300));
                         }
@@ -444,27 +508,32 @@ impl Chip8Machine {
                         {
                             key_state |= 1 << INPUT_MAPPING.iter().position(|&x| x == c).unwrap();
                         }
-                        _ => (),
+                        _ => todo!("handle other keys"),
                     }
                 }
             }
             input.store(key_state, Ordering::Relaxed);
-            display_tx.send(DISPLAY_REFRESH_SIGNAL).unwrap();
+            display_tx.send(DisplaySignal::Refresh).unwrap();
             thread::sleep(Duration::from_secs_f32(1. / DISPLAY_REFRESH_HZ));
         });
+        Ok((display_rx, input_tx))
+    }
+    fn run(&mut self) -> Result<ExitKind, String> {
+        let mut stdout = self.setup_terminal()?;
+        let channels = self.spawn_extra_threads()?;
         loop {
             if self.pc >= MEMORY_SIZE as Addr {
-                timer_tx.send(TIMER_TERM_SIGNAL).unwrap();
-                input_tx.send(DISPLAY_TERM_SIGNAL).unwrap();
+                channels.halt()?;
                 return Ok(ExitKind::Natural);
             }
-            match display_rx.try_recv() {
-                Ok(DISPLAY_EXIT_SIGNAL) => {
-                    timer_tx.send(TIMER_TERM_SIGNAL).unwrap();
-                    input_tx.send(DISPLAY_TERM_SIGNAL).unwrap();
+            match channels.display_rx.try_recv() {
+                Ok(DisplaySignal::Exit) => {
+                    channels.halt()?;
                     return Ok(ExitKind::Forced);
                 }
-                Ok(DISPLAY_REFRESH_SIGNAL) => {}
+                Ok(DisplaySignal::Refresh) => {
+                    todo!("draw the screen");
+                }
                 _ => (),
             }
             let high = *self.mem.get(self.pc);
@@ -520,19 +589,33 @@ impl Chip8Machine {
     }
 }
 
+#[derive(FromArgs)]
+/// Runs a chip-8 program
+struct Args {
+    /// parse hex file into binary
+    #[argh(switch, short = 'x')]
+    hex: bool,
+    /// the file to execute
+    #[argh(positional)]
+    file: String,
+}
+
 fn main() {
-    match Chip8Machine::run_binary(b"\x12\x00") {
+    let args: Args = argh::from_env();
+    match Chip8Machine::run_from_args(args) {
         Ok(kind) => {
             terminal::disable_raw_mode().unwrap();
             match kind {
                 ExitKind::Natural => {
-                    println!("Program exited gracefully");
+                    todo!("handle graceful exit")
                 }
                 ExitKind::Forced => {
-                    println!("Program killed");
+                    todo!("handle forced exit")
                 }
             }
         }
-        Err(e) => panic!("{}", e),
+        Err(e) => {
+            todo!("handle errors {:?}", e)
+        }
     }
 }
