@@ -1,25 +1,19 @@
-use std::{
-    fmt::Debug,
-    fs::File,
-    io::{stdout, Read, Stdout, Write},
-    ops::{Index, IndexMut},
-    sync::{
+use std::{fmt::Debug, fs::{File, OpenOptions}, io::{stdout, Read, Stdout, Write}, ops::{Index, IndexMut}, sync::{
         atomic::{AtomicU16, AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
         Arc,
-    },
-    thread,
-    time::Duration,
-};
+    }, thread, time::Duration};
 
 use argh::FromArgs;
 use crossterm::{
-    cursor,
+    cursor::{self, MoveTo},
     event::{self, KeyCode, KeyModifiers},
     style::{Color, Colors, Print, SetBackgroundColor, SetColors},
     terminal, ExecutableCommand, QueueableCommand,
 };
 use rand::{rngs::ThreadRng, thread_rng, Rng};
+
+type C8Result<T> = Result<T, String>;
 
 type Nibble = u8;
 type Byte = u8;
@@ -31,8 +25,17 @@ const FONT_START: usize = 0x000;
 const FONT_SIZE: usize = 5;
 const PROGRAM_START: usize = 0x200;
 const STACK_DEPTH: usize = 32;
-const FRAME_HEIGHT: usize = 32;
 const DISPLAY_REFRESH_HZ: f32 = 60.;
+const SPRITE_WIDTH: u8 = 8;
+const SCREEN_HEIGHT: usize = 32;
+const SCREEN_WIDTH: usize = 64;
+const SCREEN_OFFSET_X: u16 = 0;
+const SCREEN_OFFSET_Y: u16 = 0;
+const PIXEL_EMPTY: &str = " ";
+// unicode bottom-half box character
+const PIXEL_HALF: &str = "\u{2584}";
+const SCREEN_ON_COLOR: Color = Color::White;
+const SCREEN_OFF_COLOR: Color = Color::DarkGrey;
 
 // Typical hex keypad:
 // 1 2 3 C
@@ -72,7 +75,7 @@ impl Default for Memory {
 }
 
 impl Memory {
-    fn from_rom(rom: &[Byte]) -> Result<Self, String> {
+    fn from_rom(rom: &[Byte]) -> C8Result<Self> {
         if PROGRAM_START + rom.len() >= MEMORY_SIZE {
             Err(format!(
                 "Rom size {:x} is greater than the alotted memory size",
@@ -157,33 +160,117 @@ struct Timers {
 }
 
 #[derive(Debug)]
-struct Framebuffer([Row; FRAME_HEIGHT]);
+struct Framebuffer {
+    data: [Row; SCREEN_HEIGHT],
+    stream: Stdout,
+}
 
 impl Default for Framebuffer {
     fn default() -> Self {
-        Self([0; FRAME_HEIGHT])
+        Self {
+            data: [0; SCREEN_HEIGHT],
+            stream: stdout(),
+        }
     }
 }
 
 impl Framebuffer {
-    fn draw_slice(&mut self, x: Byte, y: Byte, slice: Byte) -> bool {
-        let row = self.0[y as usize];
+    fn get_slice(&self, x: Byte, y: Byte) -> Byte {
+        (self.data[y as usize] >> x as Row) as Byte
+    }
+    fn buffer_slice(&mut self, x: Byte, y: Byte, slice: Byte) -> bool {
+        let row = self.data[y as usize];
         // parentheses required  by the parser
         let shifted = (slice as Row) << x as Row;
         let result = row ^ shifted;
         let unset = row & !result;
-        self.0[y as usize] = result;
+        self.data[y as usize] = result;
         unset != 0
+    }
+    fn draw_slice(&mut self, top: Byte, bottom: Byte) {
+        for i in 0..SPRITE_WIDTH {
+            let top_px = top & 1 << i != 0;
+            let bottom_px = bottom & 1 << i != 0;
+
+            if top_px && bottom_px {
+                self.stream
+                    .queue(SetBackgroundColor(SCREEN_ON_COLOR))
+                    .unwrap()
+                    .queue(Print(PIXEL_EMPTY)).unwrap();
+            } else if !top_px && !bottom_px {
+                self.stream
+                    .queue(SetBackgroundColor(SCREEN_OFF_COLOR))
+                    .unwrap()
+                    .queue(Print(PIXEL_EMPTY)).unwrap();
+            } else {
+                self.stream
+                    .queue(SetColors(Colors::new(if bottom_px {
+                        SCREEN_ON_COLOR
+                    } else {
+                        SCREEN_OFF_COLOR
+                    }, if top_px {
+                        SCREEN_ON_COLOR
+                    } else {
+                        SCREEN_OFF_COLOR
+                    })))
+                    .unwrap()
+                    .queue(Print(PIXEL_HALF))
+                    .unwrap();
+            }
+        }
     }
     fn draw_sprite(&mut self, x: Byte, y: Byte, sprite: &[Byte]) -> bool {
         let mut flag = false;
-        for (offset, slice) in sprite.iter().enumerate() {
-            flag |= self.draw_slice(x, y + offset as Byte, *slice);
+        for (offset, slice) in sprite.iter().map(|n| n.reverse_bits()).enumerate() {
+            flag |= self.buffer_slice(x, y + offset as Byte, slice);
         }
+        let mut offset = 0u16;
+        let aligned = if y & 1 == 1 {
+            let top = self.get_slice(x, y - 1);
+            let bottom = sprite[0].reverse_bits();
+            self.stream.queue(MoveTo(
+                SCREEN_OFFSET_X + x as u16, 
+                SCREEN_OFFSET_Y + y as u16,
+            )).unwrap();
+            self.draw_slice(top, bottom);
+            offset += 1;
+            &sprite[1..]
+        } else {
+            sprite
+        };
+        for slices in aligned.chunks(2) {
+            self.stream
+                .queue(MoveTo(
+                    SCREEN_OFFSET_X + x as u16,
+                    SCREEN_OFFSET_Y + y as u16 + offset as u16,
+                ))
+                .unwrap();
+            if let &[top, bottom] = slices {
+                self.draw_slice(top.reverse_bits(), bottom.reverse_bits());
+                offset += 1;
+            } else if let &[top] = slices {
+                let bottom = self.get_slice(x, y + 2 * offset as u8 + 1);
+                self.draw_slice(top.reverse_bits(), bottom);
+            }
+        }
+        self.stream.flush().unwrap();
         flag
     }
     fn clear(&mut self) {
-        self.0 = unsafe { std::mem::zeroed() }
+        self.data = [0; SCREEN_HEIGHT];
+        for y in 0..SCREEN_HEIGHT {
+            self.stream
+                .queue(MoveTo(SCREEN_OFFSET_X, SCREEN_OFFSET_Y + y as u16))
+                .unwrap();
+            self.stream
+                .queue(SetBackgroundColor(SCREEN_OFF_COLOR))
+                .unwrap();
+            let empty_row = PIXEL_EMPTY.repeat(SCREEN_WIDTH);
+            self.stream
+                .queue(Print(empty_row))
+                .unwrap();
+        }
+        self.stream.flush().unwrap();
     }
 }
 
@@ -315,7 +402,7 @@ impl Chip8Machine {
         self.reg[x] = self.rng.gen::<Byte>() & b;
     }
     fn drw_vx_vy_n(&mut self, x: Reg, y: Reg, n: Nibble) {
-        let flag = self.buf.draw_sprite(x, y, self.mem.get_slice(n));
+        let flag = self.buf.draw_sprite(self.reg[x], self.reg[y], self.mem.get_slice(n));
         self.reg.set_flag(flag);
     }
     fn skp_vx(&mut self, x: Reg) {
@@ -366,8 +453,7 @@ impl Chip8Machine {
 enum HaltSignal {
     Halt,
 }
-enum DisplaySignal {
-    Refresh,
+enum InputSignal {
     Exit,
 }
 enum ExitKind {
@@ -378,11 +464,11 @@ enum ExitKind {
 struct ChannelHandler {
     timer_tx: Sender<HaltSignal>,
     input_tx: Sender<HaltSignal>,
-    display_rx: Receiver<DisplaySignal>,
+    input_rx: Receiver<InputSignal>,
 }
 
 impl ChannelHandler {
-    fn halt(&self) -> Result<(), String> {
+    fn halt(&self) -> C8Result<()> {
         for tx in &[&self.input_tx, &self.timer_tx] {
             tx.send(HaltSignal::Halt)
                 .map_err(|e| format!("Could not send message to thread: {:?}", e))?;
@@ -392,7 +478,7 @@ impl ChannelHandler {
 }
 
 impl Chip8Machine {
-    fn new(rom: &[Byte]) -> Result<Self, String> {
+    fn new(rom: &[Byte]) -> C8Result<Self> {
         Ok(Self {
             mem: Memory::from_rom(rom)?,
             rng: thread_rng(),
@@ -400,7 +486,7 @@ impl Chip8Machine {
             ..Default::default()
         })
     }
-    fn run_from_args(args: Args) -> Result<ExitKind, String> {
+    fn run_from_args(args: Args) -> C8Result<ExitKind> {
         let executor = if args.hex {
             Self::run_hex
         } else {
@@ -413,7 +499,7 @@ impl Chip8Machine {
             .map_err(|e| format!("Error occurred trying to read the file: {:?}", e))?;
         executor(&buf)
     }
-    fn run_hex(rom: &[Byte]) -> Result<ExitKind, String> {
+    fn run_hex(rom: &[Byte]) -> C8Result<ExitKind> {
         let mut bin = vec![];
         let hex = |c: u8| match c {
             n @ b'0'..=b'9' => Ok(n - b'0'),
@@ -432,11 +518,11 @@ impl Chip8Machine {
         let mut machine = Self::new(rom)?;
         machine.run()
     }
-    fn run_binary(rom: &[Byte]) -> Result<ExitKind, String> {
+    fn run_binary(rom: &[Byte]) -> C8Result<ExitKind> {
         let mut machine = Self::new(rom)?;
         machine.run()
     }
-    fn setup_terminal(&self) -> Result<Stdout, String> {
+    fn setup_terminal(&self) -> C8Result<Stdout> {
         let mut stdout = stdout();
         stdout
             .execute(cursor::Hide)
@@ -447,16 +533,26 @@ impl Chip8Machine {
 
         Ok(stdout)
     }
-    fn spawn_extra_threads(&self) -> Result<ChannelHandler, String> {
+    fn teardown_terminal(&self) -> C8Result<()> {
+        let mut stdout = stdout();
+        stdout
+            .execute(cursor::Show)
+            .map_err(|e| format!("Could not show cursor: {:?}", e))?;
+        
+        terminal::disable_raw_mode()
+            .map_err(|e| format!("Could not enable terminal raw mode: {:?}", e))?;
+        Ok(())
+    }
+    fn spawn_extra_threads(&self) -> C8Result<ChannelHandler> {
         let timer_tx = self.spawn_timer()?;
         let (display_rx, input_tx) = self.spawn_display()?;
         Ok(ChannelHandler {
             timer_tx,
             input_tx,
-            display_rx,
+            input_rx: display_rx,
         })
     }
-    fn spawn_timer(&self) -> Result<Sender<HaltSignal>, String> {
+    fn spawn_timer(&self) -> C8Result<Sender<HaltSignal>> {
         let dt = Arc::clone(&self.timers.dt);
         let st = Arc::clone(&self.timers.st);
         let (timer_tx, timer_rx) = mpsc::channel();
@@ -485,7 +581,7 @@ impl Chip8Machine {
         });
         Ok(timer_tx)
     }
-    fn spawn_display(&self) -> Result<(Receiver<DisplaySignal>, Sender<HaltSignal>), String> {
+    fn spawn_display(&self) -> C8Result<(Receiver<InputSignal>, Sender<HaltSignal>)> {
         let input = Arc::clone(&self.input.bits);
         let (display_tx, display_rx) = mpsc::channel();
         let (input_tx, input_rx) = mpsc::channel();
@@ -499,7 +595,7 @@ impl Chip8Machine {
                 if let event::Event::Key(k) = event::read().unwrap() {
                     match k.code {
                         KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
-                            display_tx.send(DisplaySignal::Exit).unwrap();
+                            display_tx.send(InputSignal::Exit).unwrap();
                             // prevents race conditions as the thread can be killed at any point after this line
                             thread::sleep(Duration::from_secs(300));
                         }
@@ -513,26 +609,24 @@ impl Chip8Machine {
                 }
             }
             input.store(key_state, Ordering::Relaxed);
-            display_tx.send(DisplaySignal::Refresh).unwrap();
             thread::sleep(Duration::from_secs_f32(1. / DISPLAY_REFRESH_HZ));
         });
         Ok((display_rx, input_tx))
     }
-    fn run(&mut self) -> Result<ExitKind, String> {
+    fn run(&mut self) -> C8Result<ExitKind> {
         let mut stdout = self.setup_terminal()?;
         let channels = self.spawn_extra_threads()?;
         loop {
             if self.pc >= MEMORY_SIZE as Addr {
                 channels.halt()?;
+                self.teardown_terminal()?;
                 return Ok(ExitKind::Natural);
             }
-            match channels.display_rx.try_recv() {
-                Ok(DisplaySignal::Exit) => {
+            match channels.input_rx.try_recv() {
+                Ok(InputSignal::Exit) => {
                     channels.halt()?;
+                    self.teardown_terminal()?;
                     return Ok(ExitKind::Forced);
-                }
-                Ok(DisplaySignal::Refresh) => {
-                    todo!("draw the screen");
                 }
                 _ => (),
             }
