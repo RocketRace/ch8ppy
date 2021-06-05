@@ -1,8 +1,16 @@
-use std::{fmt::Debug, fs::{File, OpenOptions}, io::{stdout, Read, Stdout, Write}, ops::{Index, IndexMut}, sync::{
+use std::{
+    fmt::{Debug, Display},
+    fs::{File, OpenOptions},
+    io::{stdout, Read, Stdout, Write},
+    ops::{Index, IndexMut},
+    sync::{
         atomic::{AtomicU16, AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
         Arc,
-    }, thread, time::Duration};
+    },
+    thread,
+    time::Duration,
+};
 
 use argh::FromArgs;
 use crossterm::{
@@ -14,6 +22,14 @@ use crossterm::{
 use rand::{rngs::ThreadRng, thread_rng, Rng};
 
 type C8Result<T> = Result<T, String>;
+trait IntoC8Result<T, M: Display> {
+    fn c8_err(self, msg: M) -> C8Result<T>;
+}
+impl<T, E: Debug, M: Display> IntoC8Result<T, M> for Result<T, E> {
+    fn c8_err(self, msg: M) -> C8Result<T> {
+        self.map_err(|e| format!("{}\nOriginal error:\n{:?}", msg, e))
+    }
+}
 
 type Nibble = u8;
 type Byte = u8;
@@ -196,23 +212,28 @@ impl Framebuffer {
                 self.stream
                     .queue(SetBackgroundColor(SCREEN_ON_COLOR))
                     .unwrap()
-                    .queue(Print(PIXEL_EMPTY)).unwrap();
+                    .queue(Print(PIXEL_EMPTY))
+                    .unwrap();
             } else if !top_px && !bottom_px {
                 self.stream
                     .queue(SetBackgroundColor(SCREEN_OFF_COLOR))
                     .unwrap()
-                    .queue(Print(PIXEL_EMPTY)).unwrap();
+                    .queue(Print(PIXEL_EMPTY))
+                    .unwrap();
             } else {
                 self.stream
-                    .queue(SetColors(Colors::new(if bottom_px {
-                        SCREEN_ON_COLOR
-                    } else {
-                        SCREEN_OFF_COLOR
-                    }, if top_px {
-                        SCREEN_ON_COLOR
-                    } else {
-                        SCREEN_OFF_COLOR
-                    })))
+                    .queue(SetColors(Colors::new(
+                        if bottom_px {
+                            SCREEN_ON_COLOR
+                        } else {
+                            SCREEN_OFF_COLOR
+                        },
+                        if top_px {
+                            SCREEN_ON_COLOR
+                        } else {
+                            SCREEN_OFF_COLOR
+                        },
+                    )))
                     .unwrap()
                     .queue(Print(PIXEL_HALF))
                     .unwrap();
@@ -228,10 +249,12 @@ impl Framebuffer {
         let aligned = if y & 1 == 1 {
             let top = self.get_slice(x, y - 1);
             let bottom = sprite[0].reverse_bits();
-            self.stream.queue(MoveTo(
-                SCREEN_OFFSET_X + x as u16, 
-                SCREEN_OFFSET_Y + y as u16,
-            )).unwrap();
+            self.stream
+                .queue(MoveTo(
+                    SCREEN_OFFSET_X + x as u16,
+                    SCREEN_OFFSET_Y + y as u16,
+                ))
+                .unwrap();
             self.draw_slice(top, bottom);
             offset += 1;
             &sprite[1..]
@@ -266,9 +289,7 @@ impl Framebuffer {
                 .queue(SetBackgroundColor(SCREEN_OFF_COLOR))
                 .unwrap();
             let empty_row = PIXEL_EMPTY.repeat(SCREEN_WIDTH);
-            self.stream
-                .queue(Print(empty_row))
-                .unwrap();
+            self.stream.queue(Print(empty_row)).unwrap();
         }
         self.stream.flush().unwrap();
     }
@@ -402,7 +423,9 @@ impl Chip8Machine {
         self.reg[x] = self.rng.gen::<Byte>() & b;
     }
     fn drw_vx_vy_n(&mut self, x: Reg, y: Reg, n: Nibble) {
-        let flag = self.buf.draw_sprite(self.reg[x], self.reg[y], self.mem.get_slice(n));
+        let flag = self
+            .buf
+            .draw_sprite(self.reg[x], self.reg[y], self.mem.get_slice(n));
         self.reg.set_flag(flag);
     }
     fn skp_vx(&mut self, x: Reg) {
@@ -471,7 +494,7 @@ impl ChannelHandler {
     fn halt(&self) -> C8Result<()> {
         for tx in &[&self.input_tx, &self.timer_tx] {
             tx.send(HaltSignal::Halt)
-                .map_err(|e| format!("Could not send message to thread: {:?}", e))?;
+                .c8_err("Could not send message to thread")?;
         }
         Ok(())
     }
@@ -494,9 +517,9 @@ impl Chip8Machine {
         };
         let mut buf = vec![];
         File::open(args.file)
-            .map_err(|e| format!("Error occurred trying to open the file: {:?}", e))?
+            .c8_err("Error occurred trying to open the file")?
             .read_to_end(&mut buf)
-            .map_err(|e| format!("Error occurred trying to read the file: {:?}", e))?;
+            .c8_err("Error occurred trying to read the file")?;
         executor(&buf)
     }
     fn run_hex(rom: &[Byte]) -> C8Result<ExitKind> {
@@ -526,10 +549,9 @@ impl Chip8Machine {
         let mut stdout = stdout();
         stdout
             .execute(cursor::Hide)
-            .map_err(|e| format!("Could not hide cursor: {:?}", e))?;
+            .c8_err("Could not hide cursor")?;
 
-        terminal::enable_raw_mode()
-            .map_err(|e| format!("Could not enable terminal raw mode: {:?}", e))?;
+        terminal::enable_raw_mode().c8_err("Could not enable terminal raw mode")?;
 
         Ok(stdout)
     }
@@ -537,10 +559,9 @@ impl Chip8Machine {
         let mut stdout = stdout();
         stdout
             .execute(cursor::Show)
-            .map_err(|e| format!("Could not show cursor: {:?}", e))?;
-        
-        terminal::disable_raw_mode()
-            .map_err(|e| format!("Could not enable terminal raw mode: {:?}", e))?;
+            .c8_err("Could not show cursor")?;
+
+        terminal::disable_raw_mode().c8_err("Could not disable terminal raw mode")?;
         Ok(())
     }
     fn spawn_extra_threads(&self) -> C8Result<ChannelHandler> {
@@ -616,6 +637,7 @@ impl Chip8Machine {
     fn run(&mut self) -> C8Result<ExitKind> {
         let mut stdout = self.setup_terminal()?;
         let channels = self.spawn_extra_threads()?;
+        self.cls();
         loop {
             if self.pc >= MEMORY_SIZE as Addr {
                 channels.halt()?;
