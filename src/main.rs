@@ -1,6 +1,6 @@
 use std::{
     fmt::{Debug, Display},
-    fs::{File, OpenOptions},
+    fs::File,
     io::{stdout, Read, Stdout, Write},
     ops::{Index, IndexMut},
     sync::{
@@ -13,12 +13,7 @@ use std::{
 };
 
 use argh::FromArgs;
-use crossterm::{
-    cursor::{self, MoveTo},
-    event::{self, KeyCode, KeyModifiers},
-    style::{Color, Colors, Print, SetBackgroundColor, SetColors},
-    terminal, ExecutableCommand, QueueableCommand,
-};
+use crossterm::{ExecutableCommand, QueueableCommand, cursor::{self, MoveTo}, event::{self, KeyCode, KeyModifiers}, style::{Color, Colors, Print, ResetColor, SetBackgroundColor, SetColors}, terminal};
 use rand::{rngs::ThreadRng, thread_rng, Rng};
 
 type C8Result<T> = Result<T, String>;
@@ -32,18 +27,17 @@ impl<T, E: Debug, M: Display> IntoC8Result<T, M> for Result<T, E> {
 }
 
 type Nibble = u8;
-type Byte = u8;
 type Addr = u16;
-type Row = u64;
 
 const MEMORY_SIZE: usize = 0x1000;
 const FONT_START: usize = 0x000;
 const FONT_SIZE: usize = 5;
 const PROGRAM_START: usize = 0x200;
 const STACK_DEPTH: usize = 32;
-const DISPLAY_REFRESH_HZ: f32 = 60.;
+const DISPLAY_REFRESH_HZ: f32 = 120.;
 const SPRITE_WIDTH: u8 = 8;
 const SCREEN_HEIGHT: usize = 32;
+const SCREEN_HEIGHT_TERMINAL_UNITS: usize = 16;
 const SCREEN_WIDTH: usize = 64;
 const SCREEN_OFFSET_X: u16 = 0;
 const SCREEN_OFFSET_Y: u16 = 0;
@@ -77,7 +71,7 @@ const INPUT_MAPPING: [char; 16] = [
 /// ETI 660 programs begin execution at address 0x600.
 #[derive(Debug)]
 struct Memory {
-    data: [Byte; MEMORY_SIZE],
+    data: [u8; MEMORY_SIZE],
     ptr: Addr,
 }
 
@@ -91,7 +85,7 @@ impl Default for Memory {
 }
 
 impl Memory {
-    fn from_rom(rom: &[Byte]) -> C8Result<Self> {
+    fn from_rom(rom: &[u8]) -> C8Result<Self> {
         if PROGRAM_START + rom.len() >= MEMORY_SIZE {
             Err(format!(
                 "Rom size {:x} is greater than the alotted memory size",
@@ -103,17 +97,17 @@ impl Memory {
             Ok(Self { data: mem, ptr: 0 })
         }
     }
-    fn get<N: Into<usize>>(&self, addr: N) -> &Byte {
+    fn get<N: Into<usize>>(&self, addr: N) -> &u8 {
         &self.data[addr.into()]
     }
-    fn get_offset<N: Into<usize>>(&self, offset: N) -> &Byte {
+    fn get_offset<N: Into<usize>>(&self, offset: N) -> &u8 {
         &self.data[self.ptr as usize + offset.into()]
     }
-    fn get_offset_mut<N: Into<usize>>(&mut self, offset: N) -> &mut Byte {
+    fn get_offset_mut<N: Into<usize>>(&mut self, offset: N) -> &mut u8 {
         &mut self.data[self.ptr as usize + offset.into()]
     }
-    fn get_slice<N: Into<usize>>(&self, offset: N) -> &[Byte] {
-        &self.data[self.ptr as usize..self.ptr as usize + offset.into()]
+    fn get_slice<N: Into<usize>>(&self, length: N) -> &[u8] {
+        &self.data[self.ptr as usize..self.ptr as usize + length.into()]
     }
 }
 
@@ -123,14 +117,14 @@ impl Memory {
 /// VF is also used for the carry flag for addition,
 /// the no-borrow flag for subtraction, and pixel collision for sprite drawing.
 #[derive(Debug, Default)]
-struct Registers([Byte; 16]);
+struct Registers([u8; 16]);
 
 type Reg = Nibble;
 const V0: Reg = 0x0;
 const VF: Reg = 0xF;
 
 impl Index<Reg> for Registers {
-    type Output = Byte;
+    type Output = u8;
 
     fn index(&self, index: Reg) -> &Self::Output {
         &self.0[index as usize]
@@ -145,7 +139,7 @@ impl IndexMut<Reg> for Registers {
 
 impl Registers {
     fn set_flag(&mut self, flag: bool) {
-        self[VF] = flag as Byte;
+        self[VF] = flag as u8;
     }
 }
 
@@ -153,7 +147,7 @@ impl Registers {
 #[derive(Debug, Default)]
 struct Stack {
     data: [Addr; STACK_DEPTH],
-    ptr: Byte,
+    ptr: u8,
 }
 
 impl Stack {
@@ -177,7 +171,7 @@ struct Timers {
 
 #[derive(Debug)]
 struct Framebuffer {
-    data: [Row; SCREEN_HEIGHT],
+    data: [u64; SCREEN_HEIGHT],
     stream: Stdout,
 }
 
@@ -191,36 +185,11 @@ impl Default for Framebuffer {
 }
 
 impl Framebuffer {
-    fn get_slice(&self, x: Byte, y: Byte) -> Byte {
-        (self.data[y as usize] >> x as Row) as Byte
-    }
-    fn buffer_slice(&mut self, x: Byte, y: Byte, slice: Byte) -> bool {
-        let row = self.data[y as usize];
-        // parentheses required  by the parser
-        let shifted = (slice as Row) << x as Row;
-        let result = row ^ shifted;
-        let unset = row & !result;
-        self.data[y as usize] = result;
-        unset != 0
-    }
-    fn draw_slice(&mut self, top: Byte, bottom: Byte) {
-        for i in 0..SPRITE_WIDTH {
+    fn draw_slice(&mut self, top: u8, bottom: u8, x: u8) {
+        for i in 0..(SCREEN_WIDTH as u8 - x).min(SPRITE_WIDTH) {
             let top_px = top & 1 << i != 0;
             let bottom_px = bottom & 1 << i != 0;
-
-            if top_px && bottom_px {
-                self.stream
-                    .queue(SetBackgroundColor(SCREEN_ON_COLOR))
-                    .unwrap()
-                    .queue(Print(PIXEL_EMPTY))
-                    .unwrap();
-            } else if !top_px && !bottom_px {
-                self.stream
-                    .queue(SetBackgroundColor(SCREEN_OFF_COLOR))
-                    .unwrap()
-                    .queue(Print(PIXEL_EMPTY))
-                    .unwrap();
-            } else {
+            if top_px ^ bottom_px {
                 self.stream
                     .queue(SetColors(Colors::new(
                         if bottom_px {
@@ -234,46 +203,69 @@ impl Framebuffer {
                             SCREEN_OFF_COLOR
                         },
                     )))
-                    .unwrap()
+                    .unwrap();
+                self.stream
                     .queue(Print(PIXEL_HALF))
+                    .unwrap();
+            } else {
+                self.stream
+                    .queue(SetBackgroundColor(if top_px {
+                        SCREEN_ON_COLOR
+                    } else {
+                        SCREEN_OFF_COLOR
+                    }))
+                    .unwrap();
+                    self.stream
+                    .queue(Print(PIXEL_EMPTY))
                     .unwrap();
             }
         }
     }
-    fn draw_sprite(&mut self, x: Byte, y: Byte, sprite: &[Byte]) -> bool {
+    fn move_to(&mut self, x: u8, y: u8) {
+        self.stream
+            .queue(MoveTo(
+                SCREEN_OFFSET_X + x as u16,
+                SCREEN_OFFSET_Y + y as u16 / 2,
+            ))
+            .unwrap();
+    }
+    fn udpate(&mut self, slice: u8, x: u8, y: u8) -> (bool, u8) {
+        let orig = self.data[y as usize];
+        let shifted = (slice as u64) << x as u64;
+        let result = orig ^ shifted;
+        self.data[y as usize] = result;
+        (orig & !result != 0, (result >> x as u64) as u8)
+    }
+    fn draw_sprite(&mut self, x: u8, y: u8, sprite: &[u8]) -> bool {
+        // todo rewrite the whole thing
+        // handle x > off limits
+        let x_pos = x % SCREEN_WIDTH as u8;
+        let y_pos = y % SCREEN_HEIGHT as u8;
         let mut flag = false;
-        for (offset, slice) in sprite.iter().map(|n| n.reverse_bits()).enumerate() {
-            flag |= self.buffer_slice(x, y + offset as Byte, slice);
+        let align_offset = y_pos & 1;
+        if align_offset != 0{
+            let top = (self.data[y_pos as usize - 1] >> x_pos as u64) as u8;
+            let (f, bottom) = self.udpate(sprite[0].reverse_bits(), x_pos, y_pos);
+            flag |= f;
+            self.move_to(x_pos, y_pos - 1);
+            self.draw_slice(top, bottom, x_pos);
         }
-        let mut offset = 0u16;
-        let aligned = if y & 1 == 1 {
-            let top = self.get_slice(x, y - 1);
-            let bottom = sprite[0].reverse_bits();
-            self.stream
-                .queue(MoveTo(
-                    SCREEN_OFFSET_X + x as u16,
-                    SCREEN_OFFSET_Y + y as u16,
-                ))
-                .unwrap();
-            self.draw_slice(top, bottom);
-            offset += 1;
-            &sprite[1..]
-        } else {
-            sprite
-        };
-        for slices in aligned.chunks(2) {
-            self.stream
-                .queue(MoveTo(
-                    SCREEN_OFFSET_X + x as u16,
-                    SCREEN_OFFSET_Y + y as u16 + offset as u16,
-                ))
-                .unwrap();
-            if let &[top, bottom] = slices {
-                self.draw_slice(top.reverse_bits(), bottom.reverse_bits());
-                offset += 1;
-            } else if let &[top] = slices {
-                let bottom = self.get_slice(x, y + 2 * offset as u8 + 1);
-                self.draw_slice(top.reverse_bits(), bottom);
+        for (i, pair) in sprite[align_offset as usize..].chunks(2).enumerate() {
+            if let &[top, bottom] = pair {
+                let y_offset = y_pos + align_offset + 2 * i as u8;
+                let (f_t, top) = self.udpate(top.reverse_bits(), x_pos, y_offset);
+                let (f_b, bottom) = self.udpate(bottom.reverse_bits(), x_pos, y_offset + 1);
+                flag |= f_t | f_b;
+                self.move_to(x_pos, y_offset);
+                self.draw_slice(top, bottom, x_pos);
+            }
+            else if let &[top] = pair {
+                let y_offset = y_pos + align_offset + 2 * i as u8;
+                let (f, top) = self.udpate(top.reverse_bits(), x_pos, y_offset);
+                flag |= f;
+                let bottom = (self.data[y_offset as usize + 1] >> x_pos as u64) as u8;
+                self.move_to(x_pos, y_offset);
+                self.draw_slice(top, bottom, x_pos);
             }
         }
         self.stream.flush().unwrap();
@@ -281,7 +273,7 @@ impl Framebuffer {
     }
     fn clear(&mut self) {
         self.data = [0; SCREEN_HEIGHT];
-        for y in 0..SCREEN_HEIGHT {
+        for y in 0..SCREEN_HEIGHT_TERMINAL_UNITS {
             self.stream
                 .queue(MoveTo(SCREEN_OFFSET_X, SCREEN_OFFSET_Y + y as u16))
                 .unwrap();
@@ -302,15 +294,14 @@ struct Input {
 
 impl Input {
     fn is_pressed(&self, x: Nibble) -> bool {
-        self.bits.load(Ordering::Relaxed) & (1 << x) != 0
+        self.bits.load(Ordering::SeqCst) & (1 << x) != 0
     }
-    fn get_key(&self) -> Nibble {
-        // this blocks until a key is pressed
-        loop {
-            let bits = self.bits.load(Ordering::Relaxed);
-            if bits != 0 {
-                break bits.trailing_zeros() as Nibble;
-            }
+    fn try_get_key(&self) -> Option<Nibble> {
+        let bits = self.bits.load(Ordering::SeqCst);
+        if bits != 0 {
+            Some(bits.trailing_zeros() as Nibble)
+        } else {
+            None
         }
     }
 }
@@ -325,10 +316,11 @@ struct Chip8Machine {
     timers: Timers,
     rng: ThreadRng,
     input: Input,
+    blocking: Option<Reg>,
 }
 
 /// Please ensure that inputs are nibbles.
-fn byte(b_0: u8, b_1: u8) -> Byte {
+fn byte(b_0: u8, b_1: u8) -> u8 {
     b_0 << 4 | b_1
 }
 /// Please ensure that inputs are nibbles.
@@ -352,12 +344,12 @@ impl Chip8Machine {
         self.stack.push(self.pc);
         self.pc = a;
     }
-    fn se_vx_bb(&mut self, x: Reg, b: Byte) {
+    fn se_vx_bb(&mut self, x: Reg, b: u8) {
         if self.reg[x] == b {
             self.pc += 2;
         }
     }
-    fn sne_vx_bb(&mut self, x: Reg, b: Byte) {
+    fn sne_vx_bb(&mut self, x: Reg, b: u8) {
         if self.reg[x] != b {
             self.pc += 2;
         }
@@ -367,10 +359,10 @@ impl Chip8Machine {
             self.pc += 2;
         }
     }
-    fn ld_vx_bb(&mut self, x: Reg, b: Byte) {
+    fn ld_vx_bb(&mut self, x: Reg, b: u8) {
         self.reg[x] = b;
     }
-    fn add_vx_bb(&mut self, x: Reg, b: Byte) {
+    fn add_vx_bb(&mut self, x: Reg, b: u8) {
         self.reg[x] += b;
     }
     fn ld_vx_vy(&mut self, x: Reg, y: Reg) {
@@ -386,23 +378,23 @@ impl Chip8Machine {
         self.reg[x] ^= self.reg[y];
     }
     fn add_vx_vy(&mut self, x: Reg, y: Reg) {
-        let (ret, flag) = self.reg[x].overflowing_add(self.reg[y]);
+        let ret = self.reg[x] + self.reg[y];
+        self.reg.set_flag(ret < self.reg[x]);
         self.reg[x] = ret;
-        self.reg.set_flag(flag);
     }
     fn sub_vx_vy(&mut self, x: Reg, y: Reg) {
-        let (ret, flag) = self.reg[x].overflowing_sub(self.reg[y]);
+        let ret = self.reg[x] - self.reg[y];
+        self.reg.set_flag(self.reg[x] > self.reg[y]);
         self.reg[x] = ret;
-        self.reg.set_flag(!flag);
     }
     fn shr_vx_vy(&mut self, x: Reg, _y: Reg) {
         self.reg.set_flag(self.reg[x] & 1 == 1);
         self.reg[x] >>= 1;
     }
     fn subn_vx_vy(&mut self, x: Reg, y: Reg) {
-        let (ret, flag) = self.reg[y].overflowing_sub(self.reg[x]);
+        let ret = self.reg[y] - self.reg[x];
+        self.reg.set_flag(self.reg[y] > self.reg[x]);
         self.reg[x] = ret;
-        self.reg.set_flag(!flag); // !
     }
     fn shl_vx_vy(&mut self, x: Reg, _y: Reg) {
         self.reg.set_flag(self.reg[x] & 0b10000000 == 0b10000000);
@@ -419,13 +411,15 @@ impl Chip8Machine {
     fn jp_v0_aaa(&mut self, a: Addr) {
         self.pc = self.reg[V0] as Addr + a;
     }
-    fn rnd_vx_bb(&mut self, x: Reg, b: Byte) {
-        self.reg[x] = self.rng.gen::<Byte>() & b;
+    fn rnd_vx_bb(&mut self, x: Reg, b: u8) {
+        self.reg[x] = self.rng.gen::<u8>() & b;
     }
     fn drw_vx_vy_n(&mut self, x: Reg, y: Reg, n: Nibble) {
-        let flag = self
-            .buf
-            .draw_sprite(self.reg[x], self.reg[y], self.mem.get_slice(n));
+        let flag = self.buf.draw_sprite(
+            self.reg[x] & (SCREEN_WIDTH as u8 - 1),
+            self.reg[y] & (SCREEN_HEIGHT as u8 - 1),
+            self.mem.get_slice(n),
+        );
         self.reg.set_flag(flag);
     }
     fn skp_vx(&mut self, x: Reg) {
@@ -439,16 +433,16 @@ impl Chip8Machine {
         }
     }
     fn ld_vx_dt(&mut self, x: Reg) {
-        self.reg[x] = self.timers.dt.load(Ordering::Relaxed);
+        self.reg[x] = self.timers.dt.load(Ordering::SeqCst);
     }
     fn ld_vx_k(&mut self, x: Reg) {
-        self.reg[x] = self.input.get_key();
+        self.try_fetch_key(x);
     }
     fn ld_dt_vx(&mut self, x: Reg) {
-        self.timers.dt.store(self.reg[x], Ordering::Relaxed);
+        self.timers.dt.store(self.reg[x], Ordering::SeqCst);
     }
     fn ld_st_vx(&mut self, x: Reg) {
-        self.timers.st.store(self.reg[x], Ordering::Relaxed);
+        self.timers.st.store(self.reg[x], Ordering::SeqCst);
     }
     fn add_i_vx(&mut self, x: Reg) {
         self.mem.ptr += self.reg[x] as Addr;
@@ -457,9 +451,10 @@ impl Chip8Machine {
         self.mem.ptr = FONT_START as Addr + self.reg[x] as Addr * FONT_SIZE as Addr;
     }
     fn ld_b_vx(&mut self, x: Reg) {
-        *self.mem.get_offset_mut(0u8) = self.reg[x] / 100;
-        *self.mem.get_offset_mut(1u8) = self.reg[x] % 100 / 10;
-        *self.mem.get_offset_mut(2u8) = self.reg[x] % 100;
+        let val = self.reg[x];
+        *self.mem.get_offset_mut(0u8) = val / 100;
+        *self.mem.get_offset_mut(1u8) = val / 10 % 10;
+        *self.mem.get_offset_mut(2u8) = val % 10;
     }
     fn ld_i_vx(&mut self, x: Reg) {
         for i in 0..=x {
@@ -501,13 +496,21 @@ impl ChannelHandler {
 }
 
 impl Chip8Machine {
-    fn new(rom: &[Byte]) -> C8Result<Self> {
+    fn new(rom: &[u8]) -> C8Result<Self> {
         Ok(Self {
             mem: Memory::from_rom(rom)?,
             rng: thread_rng(),
             pc: PROGRAM_START as Addr,
             ..Default::default()
         })
+    }
+    fn try_fetch_key(&mut self, reg: Reg) {
+        if let Some(k) = self.input.try_get_key() {
+            self.reg[reg] = k;
+            self.blocking = None;
+        } else {
+            self.blocking = Some(reg);
+        }
     }
     fn run_from_args(args: Args) -> C8Result<ExitKind> {
         let executor = if args.hex {
@@ -522,7 +525,7 @@ impl Chip8Machine {
             .c8_err("Error occurred trying to read the file")?;
         executor(&buf)
     }
-    fn run_hex(rom: &[Byte]) -> C8Result<ExitKind> {
+    fn run_hex(rom: &[u8]) -> C8Result<ExitKind> {
         let mut bin = vec![];
         let hex = |c: u8| match c {
             n @ b'0'..=b'9' => Ok(n - b'0'),
@@ -541,11 +544,11 @@ impl Chip8Machine {
         let mut machine = Self::new(rom)?;
         machine.run()
     }
-    fn run_binary(rom: &[Byte]) -> C8Result<ExitKind> {
+    fn run_binary(rom: &[u8]) -> C8Result<ExitKind> {
         let mut machine = Self::new(rom)?;
         machine.run()
     }
-    fn setup_terminal(&self) -> C8Result<Stdout> {
+    fn setup_terminal(&self) -> C8Result<()> {
         let mut stdout = stdout();
         stdout
             .execute(cursor::Hide)
@@ -553,13 +556,19 @@ impl Chip8Machine {
 
         terminal::enable_raw_mode().c8_err("Could not enable terminal raw mode")?;
 
-        Ok(stdout)
+        Ok(())
     }
     fn teardown_terminal(&self) -> C8Result<()> {
         let mut stdout = stdout();
         stdout
-            .execute(cursor::Show)
+            .queue(cursor::Show)
             .c8_err("Could not show cursor")?;
+        stdout
+            .queue(ResetColor)
+            .c8_err("Could not reset colors")?;
+        stdout
+            .flush()
+            .c8_err("Could not flush stdout")?;
 
         terminal::disable_raw_mode().c8_err("Could not disable terminal raw mode")?;
         Ok(())
@@ -584,14 +593,14 @@ impl Chip8Machine {
             }
             // Result is ignored, since we don't care about the
             // registers when they're zero
-            let _ = dt.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            let _ = dt.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n != 0 {
                     Some(n - 1)
                 } else {
                     None
                 }
             });
-            let _ = st.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            let _ = st.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n != 0 {
                     Some(n - 1)
                 } else {
@@ -612,53 +621,54 @@ impl Chip8Machine {
                 Err(TryRecvError::Empty) => (),
             }
             let mut key_state = 0u16;
-            while event::poll(Duration::from_millis(0)).unwrap() {
-                if let event::Event::Key(k) = event::read().unwrap() {
-                    match k.code {
-                        KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
-                            display_tx.send(InputSignal::Exit).unwrap();
-                            // prevents race conditions as the thread can be killed at any point after this line
-                            thread::sleep(Duration::from_secs(300));
-                        }
-                        KeyCode::Char(c)
-                            if k.modifiers == KeyModifiers::NONE && INPUT_MAPPING.contains(&c) =>
-                        {
-                            key_state |= 1 << INPUT_MAPPING.iter().position(|&x| x == c).unwrap();
-                        }
-                        _ => todo!("handle other keys"),
+            if let Ok(event::Event::Key(k)) = event::read() {
+                match k.code {
+                    KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
+                        display_tx.send(InputSignal::Exit).unwrap();
+                        // prevents race conditions as the thread can be killed at any point after this line
+                        thread::sleep(Duration::from_secs(300));
                     }
+                    KeyCode::Char(c)
+                        if k.modifiers == KeyModifiers::NONE && INPUT_MAPPING.contains(&c) =>
+                    {
+                        key_state |= 1 << INPUT_MAPPING.iter().position(|&x| x == c).unwrap();
+                    }
+                    _ => (/* handle other keys */),
                 }
             }
-            input.store(key_state, Ordering::Relaxed);
-            thread::sleep(Duration::from_secs_f32(1. / DISPLAY_REFRESH_HZ));
+            input.store(key_state, Ordering::SeqCst);
         });
         Ok((display_rx, input_tx))
     }
     fn run(&mut self) -> C8Result<ExitKind> {
-        let mut stdout = self.setup_terminal()?;
+        self.setup_terminal()?;
         let channels = self.spawn_extra_threads()?;
-        self.cls();
+        self.buf.clear();
         loop {
-            if self.pc >= MEMORY_SIZE as Addr {
-                channels.halt()?;
-                self.teardown_terminal()?;
-                return Ok(ExitKind::Natural);
-            }
             match channels.input_rx.try_recv() {
                 Ok(InputSignal::Exit) => {
-                    channels.halt()?;
                     self.teardown_terminal()?;
+                    channels.halt()?;
                     return Ok(ExitKind::Forced);
                 }
                 _ => (),
             }
-            let high = *self.mem.get(self.pc);
-            let low = *self.mem.get(self.pc + 1);
-            self.pc += 2;
-            self.execute(high, low);
+            if let Some(reg) = self.blocking {
+                self.try_fetch_key(reg)
+            } else {
+                if self.pc >= MEMORY_SIZE as Addr {
+                    self.teardown_terminal()?;
+                    channels.halt()?;
+                    return Ok(ExitKind::Natural);
+                }
+                let high = *self.mem.get(self.pc);
+                let low = *self.mem.get(self.pc + 1);
+                self.pc += 2;
+                self.execute(high, low);
+            }
         }
     }
-    fn execute(&mut self, high: Byte, low: Byte) {
+    fn execute(&mut self, high: u8, low: u8) {
         let h_h = high >> 4;
         let h_l = high & 0b00001111;
         let l_h = low >> 4;
@@ -705,8 +715,8 @@ impl Chip8Machine {
     }
 }
 
-#[derive(FromArgs)]
 /// Runs a chip-8 program
+#[derive(FromArgs)]
 struct Args {
     /// parse hex file into binary
     #[argh(switch, short = 'x')]
@@ -719,19 +729,16 @@ struct Args {
 fn main() {
     let args: Args = argh::from_env();
     match Chip8Machine::run_from_args(args) {
-        Ok(kind) => {
-            terminal::disable_raw_mode().unwrap();
-            match kind {
-                ExitKind::Natural => {
-                    todo!("handle graceful exit")
-                }
-                ExitKind::Forced => {
-                    todo!("handle forced exit")
-                }
+        Ok(kind) => match kind {
+            ExitKind::Natural => {
+                println!("handle graceful exit")
             }
-        }
+            ExitKind::Forced => {
+                println!("handle forced exit")
+            }
+        },
         Err(e) => {
-            todo!("handle errors {:?}", e)
+            dbg!(e);
         }
     }
 }
