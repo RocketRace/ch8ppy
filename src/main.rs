@@ -3,17 +3,24 @@ use std::{
     fs::File,
     io::{stdout, Read, Stdout, Write},
     ops::{Index, IndexMut},
+    process::exit,
     sync::{
         atomic::{AtomicU16, AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use argh::FromArgs;
-use crossterm::{ExecutableCommand, QueueableCommand, cursor::{self, MoveTo}, event::{self, KeyCode, KeyModifiers}, style::{Color, Colors, Print, ResetColor, SetBackgroundColor, SetColors}, terminal};
+use crossterm::{
+    cursor::{self, MoveTo},
+    event::{self, KeyCode, KeyModifiers},
+    style::{Color, Colors, Print, ResetColor, SetBackgroundColor, SetColors},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    QueueableCommand,
+};
 use rand::{rngs::ThreadRng, thread_rng, Rng};
 
 type C8Result<T> = Result<T, String>;
@@ -34,7 +41,6 @@ const FONT_START: usize = 0x000;
 const FONT_SIZE: usize = 5;
 const PROGRAM_START: usize = 0x200;
 const STACK_DEPTH: usize = 32;
-const DISPLAY_REFRESH_HZ: f32 = 120.;
 const SPRITE_WIDTH: u8 = 8;
 const SCREEN_HEIGHT: usize = 32;
 const SCREEN_HEIGHT_TERMINAL_UNITS: usize = 16;
@@ -46,6 +52,8 @@ const PIXEL_EMPTY: &str = " ";
 const PIXEL_HALF: &str = "\u{2584}";
 const SCREEN_ON_COLOR: Color = Color::White;
 const SCREEN_OFF_COLOR: Color = Color::DarkGrey;
+const TIMER_TICK_RATE_HZ: f32 = 60.;
+const INPUT_TIMEOUT: Duration = Duration::from_millis(17);
 
 // Typical hex keypad:
 // 1 2 3 C
@@ -57,9 +65,19 @@ const SCREEN_OFF_COLOR: Color = Color::DarkGrey;
 // q w e r
 // a s d f
 // z x c v
-const INPUT_MAPPING: [char; 16] = [
-    'x', '1', '2', '3', 'q', 'w', 'e', 'a', 's', 'd', 'z', 'c', '4', 'r', 'f', 'v',
-];
+macro_rules! INPUT_MATCH {
+    ($target:expr => $result:expr) => {
+        INPUT_MATCH!(@inner $target; $result; 'x'0'1'1'2'2'3'3'q'4'w'5'e'6'a'7's'8'd'9'z'10'c'11'4'12'r'13'f'14'v'15);
+    };
+    (@inner $target:expr; $result:expr; $($chr:literal $idx:literal)*) => {
+        match ($target).code {
+            $(
+                KeyCode::Char($chr) => {($result)($idx)},
+            )*
+            _ => ()
+        }
+    };
+}
 
 /// The main memory of the CHIP-8 virtual machine.
 ///
@@ -204,9 +222,7 @@ impl Framebuffer {
                         },
                     )))
                     .unwrap();
-                self.stream
-                    .queue(Print(PIXEL_HALF))
-                    .unwrap();
+                self.stream.queue(Print(PIXEL_HALF)).unwrap();
             } else {
                 self.stream
                     .queue(SetBackgroundColor(if top_px {
@@ -215,9 +231,7 @@ impl Framebuffer {
                         SCREEN_OFF_COLOR
                     }))
                     .unwrap();
-                    self.stream
-                    .queue(Print(PIXEL_EMPTY))
-                    .unwrap();
+                self.stream.queue(Print(PIXEL_EMPTY)).unwrap();
             }
         }
     }
@@ -243,7 +257,7 @@ impl Framebuffer {
         let y_pos = y % SCREEN_HEIGHT as u8;
         let mut flag = false;
         let align_offset = y_pos & 1;
-        if align_offset != 0{
+        if align_offset != 0 {
             let top = (self.data[y_pos as usize - 1] >> x_pos as u64) as u8;
             let (f, bottom) = self.udpate(sprite[0].reverse_bits(), x_pos, y_pos);
             flag |= f;
@@ -258,8 +272,7 @@ impl Framebuffer {
                 flag |= f_t | f_b;
                 self.move_to(x_pos, y_offset);
                 self.draw_slice(top, bottom, x_pos);
-            }
-            else if let &[top] = pair {
+            } else if let &[top] = pair {
                 let y_offset = y_pos + align_offset + 2 * i as u8;
                 let (f, top) = self.udpate(top.reverse_bits(), x_pos, y_offset);
                 flag |= f;
@@ -316,7 +329,6 @@ struct Chip8Machine {
     timers: Timers,
     rng: ThreadRng,
     input: Input,
-    blocking: Option<Reg>,
 }
 
 /// Please ensure that inputs are nibbles.
@@ -436,7 +448,11 @@ impl Chip8Machine {
         self.reg[x] = self.timers.dt.load(Ordering::SeqCst);
     }
     fn ld_vx_k(&mut self, x: Reg) {
-        self.try_fetch_key(x);
+        if let Some(key) = self.input.try_get_key() {
+            self.reg[x] = key;
+        } else {
+            self.pc -= 2;
+        }
     }
     fn ld_dt_vx(&mut self, x: Reg) {
         self.timers.dt.store(self.reg[x], Ordering::SeqCst);
@@ -504,14 +520,6 @@ impl Chip8Machine {
             ..Default::default()
         })
     }
-    fn try_fetch_key(&mut self, reg: Reg) {
-        if let Some(k) = self.input.try_get_key() {
-            self.reg[reg] = k;
-            self.blocking = None;
-        } else {
-            self.blocking = Some(reg);
-        }
-    }
     fn run_from_args(args: Args) -> C8Result<ExitKind> {
         let executor = if args.hex {
             Self::run_hex
@@ -551,26 +559,30 @@ impl Chip8Machine {
     fn setup_terminal(&self) -> C8Result<()> {
         let mut stdout = stdout();
         stdout
-            .execute(cursor::Hide)
-            .c8_err("Could not hide cursor")?;
+            .queue(cursor::Hide)
+            .c8_err("Could not hide cursor")?
+            .queue(EnterAlternateScreen)
+            .c8_err("Could not enter alternate screen")?
+            .flush()
+            .c8_err("Could not flush stdout")?;
 
         terminal::enable_raw_mode().c8_err("Could not enable terminal raw mode")?;
 
         Ok(())
     }
     fn teardown_terminal(&self) -> C8Result<()> {
+        terminal::disable_raw_mode().c8_err("Could not disable terminal raw mode")?;
         let mut stdout = stdout();
         stdout
+            .queue(LeaveAlternateScreen)
+            .c8_err("Could not leave alternate screen")?
             .queue(cursor::Show)
-            .c8_err("Could not show cursor")?;
-        stdout
+            .c8_err("Could not show cursor")?
             .queue(ResetColor)
-            .c8_err("Could not reset colors")?;
-        stdout
+            .c8_err("Could not reset colors")?
             .flush()
             .c8_err("Could not flush stdout")?;
 
-        terminal::disable_raw_mode().c8_err("Could not disable terminal raw mode")?;
         Ok(())
     }
     fn spawn_extra_threads(&self) -> C8Result<ChannelHandler> {
@@ -607,7 +619,7 @@ impl Chip8Machine {
                     None
                 }
             });
-            thread::sleep(Duration::from_secs_f32(1. / 60.));
+            thread::sleep(Duration::from_secs_f32(1. / TIMER_TICK_RATE_HZ));
         });
         Ok(timer_tx)
     }
@@ -615,28 +627,58 @@ impl Chip8Machine {
         let input = Arc::clone(&self.input.bits);
         let (display_tx, display_rx) = mpsc::channel();
         let (input_tx, input_rx) = mpsc::channel();
-        thread::spawn(move || loop {
-            match input_rx.try_recv() {
-                Ok(HaltSignal::Halt) | Err(TryRecvError::Disconnected) => break,
-                Err(TryRecvError::Empty) => (),
-            }
-            let mut key_state = 0u16;
-            if let Ok(event::Event::Key(k)) = event::read() {
-                match k.code {
-                    KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
-                        display_tx.send(InputSignal::Exit).unwrap();
-                        // prevents race conditions as the thread can be killed at any point after this line
-                        thread::sleep(Duration::from_secs(300));
-                    }
-                    KeyCode::Char(c)
-                        if k.modifiers == KeyModifiers::NONE && INPUT_MAPPING.contains(&c) =>
-                    {
-                        key_state |= 1 << INPUT_MAPPING.iter().position(|&x| x == c).unwrap();
-                    }
-                    _ => (/* handle other keys */),
+        thread::spawn(move || {
+            loop {
+                let mut starts: [Option<Instant>; 16] = [None; 16];
+                match input_rx.try_recv() {
+                    Ok(HaltSignal::Halt) | Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => (),
                 }
+                let next_timeout = starts
+                    .iter()
+                    .flatten()
+                    .min()
+                    .map_or(INPUT_TIMEOUT, |inst| inst.duration_since(Instant::now()));
+                let result = event::poll(next_timeout);
+                starts = {
+                    let mut new = [None; 16];
+                    for (i, &start) in starts.iter().enumerate() {
+                        new[i] = if let Some(inst) = start {
+                            if inst <= Instant::now() {
+                                None
+                            } else {
+                                Some(inst)
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    new
+                };
+                if let Ok(true) = result {
+                    if let Ok(event::Event::Key(k)) = event::read() {
+                        if let KeyModifiers::NONE = k.modifiers {
+                            INPUT_MATCH! {
+                                k => |i| {starts[i] = Some(Instant::now() + INPUT_TIMEOUT)}
+                            }
+                        } else {
+                            match k.code {
+                                KeyCode::Char('c') => {
+                                    display_tx.send(InputSignal::Exit).unwrap();
+                                    // prevents race conditions as the thread can be killed at any point after this line
+                                    thread::sleep(Duration::from_secs(300));
+                                }
+                                _ => (),
+                            }
+                        }
+                    }
+                }
+                let mut key_state = 0u16;
+                for i in 0..16 {
+                    key_state |= (starts[i].is_some() as u16) << i;
+                }
+                input.store(key_state, Ordering::SeqCst);
             }
-            input.store(key_state, Ordering::SeqCst);
         });
         Ok((display_rx, input_tx))
     }
@@ -653,19 +695,15 @@ impl Chip8Machine {
                 }
                 _ => (),
             }
-            if let Some(reg) = self.blocking {
-                self.try_fetch_key(reg)
-            } else {
-                if self.pc >= MEMORY_SIZE as Addr {
-                    self.teardown_terminal()?;
-                    channels.halt()?;
-                    return Ok(ExitKind::Natural);
-                }
-                let high = *self.mem.get(self.pc);
-                let low = *self.mem.get(self.pc + 1);
-                self.pc += 2;
-                self.execute(high, low);
+            if self.pc >= MEMORY_SIZE as Addr {
+                self.teardown_terminal()?;
+                channels.halt()?;
+                return Ok(ExitKind::Natural);
             }
+            let high = *self.mem.get(self.pc);
+            let low = *self.mem.get(self.pc + 1);
+            self.pc += 2;
+            self.execute(high, low);
         }
     }
     fn execute(&mut self, high: u8, low: u8) {
@@ -731,14 +769,15 @@ fn main() {
     match Chip8Machine::run_from_args(args) {
         Ok(kind) => match kind {
             ExitKind::Natural => {
-                println!("handle graceful exit")
+                exit(0);
             }
             ExitKind::Forced => {
-                println!("handle forced exit")
+                exit(130);
             }
         },
         Err(e) => {
-            dbg!(e);
+            println!("An unexpected error occurred: {}", e);
+            exit(1);
         }
     }
 }
